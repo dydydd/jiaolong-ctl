@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# 蛟龙16K 功耗档位切换（只依赖 ryzenadj + sysfs）
+#
+# 用法：  ryzenadj-profile [low-power|balanced|performance|custom]
+# 不传参数 = balanced。custom 读取 /etc/jiaolong/custom.conf（由 jiaolong-helper 校验后写入）。
+#
+# 本机没有 platform_profile，CPU 功耗墙靠 ryzenadj 写 SMU，GPU 侧靠 EC 的 ctgp_offset
+# （nvidia-smi -pl 在本机不被驱动支持）。风扇曲线由 EC 固件管理，这里不碰。
+# ⚠️ 功耗墙重启即失效，所以开机要靠 systemd 服务再套一次。
+
+set -uo pipefail
+
+PRESET="${1:-balanced}"
+CONF=/etc/jiaolong/custom.conf
+EC_DEV=$(ls -d /sys/bus/platform/devices/INOU0000:0* 2>/dev/null | head -1)
+
+# 单位：功耗 W，温度 ℃。BOOST=1 允许睿频；EPP 为 amd-pstate-epp 倾向
+BOOST=1; EPP=balance_performance
+case "$PRESET" in
+  low-power)   STAPM=35; FAST=45;  SLOW=35; TCTL=90; CTGP=0  ;;
+  balanced)    STAPM=65; FAST=100; SLOW=65; TCTL=95; CTGP=5  ;;
+  performance) STAPM=80; FAST=100; SLOW=80; TCTL=99; CTGP=15 ;;
+  custom)
+    [ -r "$CONF" ] || { echo "没有 $CONF，先在控制中心保存一次自定义参数" >&2; exit 2; }
+    # shellcheck disable=SC1090
+    . "$CONF"   # STAPM FAST SLOW TCTL CTGP BOOST EPP，均由 helper 校验过
+    ;;
+  *)
+    echo "用法: $(basename "$0") [low-power|balanced|performance|custom]" >&2
+    exit 2
+    ;;
+esac
+
+rc=0
+
+# --- EC 性能档位（0x0751 的 0xB0 位：A0=静音 00=均衡 10=性能）---
+# 这是 Windows 控制台"切模式"所做的事：EC 自己据此切 SPL、风扇曲线和键旁指示灯。
+# 约定来自 tuxedo-drivers（同款 Uniwill EC），并经本机实测：A0→SPL 35W、00→65W、10→80W。
+# 安全措施：仅限 GM6BG0Q；先读后写，只改 0xB0 位；写后读回校验；任何一步异常就放弃。
+ec_call() { echo "$1" > /proc/acpi/call && tr -d '\0' < /proc/acpi/call; }
+set_ec_mode() {
+  local bits=$1 cur new back
+  [ "$(cat /sys/class/dmi/id/board_name 2>/dev/null)" = "GM6BG0Q" ] || return 0
+  [ -w /proc/acpi/call ] || modprobe acpi_call 2>/dev/null
+  [ -w /proc/acpi/call ] || { echo "EC: acpi_call 不可用，跳过（指示灯不会变）" >&2; return 1; }
+  cur=$(ec_call '\_SB.INOU.ECRR 0x751')
+  [[ "$cur" =~ ^0x[0-9a-fA-F]{1,2}$ ]] || { echo "EC: 读 0x751 异常($cur)，放弃写入" >&2; return 1; }
+  new=$(( (cur & ~0xB0) | bits ))
+  ec_call "\\_SB.INOU.ECRW 0x751 $new" >/dev/null
+  sleep 0.2
+  back=$(ec_call '\_SB.INOU.ECRR 0x751')
+  if [ $(( back )) -eq "$new" ]; then
+    echo "EC: 性能档寄存器 0x751 = $(printf '0x%02x' "$new")"
+  else
+    echo "EC: 写入后读回 $back ≠ $(printf '0x%02x' "$new")" >&2; return 1
+  fi
+}
+case "$PRESET" in
+  low-power) EC_BITS=$((0xA0)) ;;
+  balanced)  EC_BITS=0 ;;
+  performance) EC_BITS=$((0x10)) ;;
+  custom)    # 按 STAPM 归到最接近的原厂档
+    if   [ "$STAPM" -le 45 ]; then EC_BITS=$((0xA0))
+    elif [ "$STAPM" -le 72 ]; then EC_BITS=0
+    else EC_BITS=$((0x10)); fi ;;
+esac
+set_ec_mode "$EC_BITS" || rc=1
+
+# --- CPU 侧：ryzenadj 写 SMU（APU 槽位与 SLOW 保持一致，否则会停在 BIOS 的 80W） ---
+if command -v ryzenadj >/dev/null 2>&1; then
+  out=$(ryzenadj --stapm-limit=$((STAPM*1000)) --fast-limit=$((FAST*1000)) \
+                 --slow-limit=$((SLOW*1000)) --apu-slow-limit=$((SLOW*1000)) \
+                 --tctl-temp="$TCTL" 2>&1)
+  if [ $? -eq 0 ]; then
+    echo "CPU: STAPM ${STAPM}W FAST ${FAST}W SLOW ${SLOW}W Tctl ${TCTL}℃"
+  else
+    echo "CPU: ryzenadj 失败 —— $out" >&2
+    rc=1
+  fi
+else
+  echo "CPU: ryzenadj 未安装，跳过" >&2
+  rc=1
+fi
+
+# --- CPU 睿频 / EPP ---
+if [ -w /sys/devices/system/cpu/cpufreq/boost ]; then
+  echo "$BOOST" > /sys/devices/system/cpu/cpufreq/boost 2>/dev/null \
+    && echo "CPU: 睿频=$BOOST" || { echo "CPU: 写 boost 失败" >&2; rc=1; }
+fi
+epp_ok=0
+for f in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do
+  [ -w "$f" ] && echo "$EPP" > "$f" 2>/dev/null && epp_ok=1
+done
+[ "$epp_ok" = 1 ] && echo "CPU: EPP=$EPP"
+
+# --- GPU 侧：EC 的 cTGP 偏移 ---
+if [ -n "$EC_DEV" ] && [ -w "$EC_DEV/ctgp_offset" ]; then
+  echo "$CTGP" > "$EC_DEV/ctgp_offset" 2>/dev/null \
+    && echo "GPU: ctgp_offset = $(cat "$EC_DEV/ctgp_offset" 2>/dev/null)" \
+    || { echo "GPU: 写 ctgp_offset 失败" >&2; rc=1; }
+else
+  echo "GPU: 找不到 INOU0000 的 ctgp_offset（驱动未加载？），跳过" >&2
+  rc=1
+fi
+
+# 记录当前档位（供性能键服务/GUI 读取）；仅在全部成功时更新
+[ "$rc" = 0 ] && echo "$PRESET" > /run/jiaolong-profile
+
+exit $rc

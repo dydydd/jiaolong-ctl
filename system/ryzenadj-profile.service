@@ -1,0 +1,13 @@
+[Unit]
+Description=Apply RyzenAdj power profile after boot
+After=multi-user.target systemd-modules-load.service
+
+[Service]
+Type=oneshot
+# 可改成 low-power / balanced / performance
+Environment=PRESET=performance
+ExecStart=/usr/local/bin/ryzenadj-profile ${PRESET}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

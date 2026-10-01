@@ -1,0 +1,101 @@
+#!/usr/bin/python3
+"""蛟龙16K 特权写入助手：只允许白名单内的 sysfs 属性和三个功耗档位。
+
+用法:
+  jiaolong-helper write <sysfs路径> <值>
+  jiaolong-helper profile <low-power|balanced|performance|custom>
+  jiaolong-helper custom <stapm_w> <fast_w> <slow_w> <tctl_c> <ctgp_w> <boost 0|1> <epp>
+由 polkit 规则放行给本机用户免密调用，因此这里必须严格校验，不接受任意路径/命令。
+"""
+import glob, os, re, subprocess, sys
+
+BOOL = lambda v: v in ("0", "1")
+EC_ATTRS = {
+    "fn_lock": BOOL, "super_key_enable": BOOL, "touchpad_toggle_enable": BOOL,
+    "rainbow_animation": BOOL, "breathing_in_suspend": BOOL,
+    "ac_auto_boot": BOOL, "usb_powershare_high": BOOL,
+    "ctgp_offset": lambda v: v.isdigit() and 0 <= int(v) <= 60,
+    "usb_c_power_priority": lambda v: v in ("charging", "performance"),
+}
+LEDS = ("uniwill:multicolor:kbd_backlight", "uniwill:multicolor:status")
+CHARGE = ("Standard", "Trickle", "Long_Life")
+PROFILES = ("low-power", "balanced", "performance", "custom")
+EPPS = ("performance", "balance_performance", "balance_power", "power", "default")
+CUSTOM_CONF = "/etc/jiaolong/custom.conf"
+# 自定义模式的数值边界：(下限, 上限)。FAST 不得低于 STAPM/SLOW，避免 SMU 拒绝或行为怪异
+LIMITS = {"STAPM": (15, 90), "FAST": (15, 120), "SLOW": (15, 90),
+          "TCTL": (60, 100), "CTGP": (0, 60)}
+
+
+def rd(p):
+    with open(p) as f:
+        return f.read().strip()
+
+
+def check_led(led, attr, val):
+    base = "/sys/class/leds/" + led
+    if attr == "brightness":
+        return val.isdigit() and int(val) <= int(rd(base + "/max_brightness"))
+    if attr == "multi_intensity":
+        parts = val.split()
+        mx = rd(base + "/multi_max_intensity").split()
+        return (len(parts) == len(mx) and
+                all(p.isdigit() and int(p) <= int(m) for p, m in zip(parts, mx)))
+    return False
+
+
+def validate(path, val):
+    path = os.path.realpath(path)
+    m = re.fullmatch(r"/sys/devices/platform/INOU0000:\d+/(\w+)", path)
+    if m and m.group(1) in EC_ATTRS:
+        return EC_ATTRS[m.group(1)](val)
+    m = re.fullmatch(r"/sys/devices/platform/INOU0000:\d+/leds/([^/]+)/(\w+)", path)
+    if m and m.group(1) in LEDS:
+        return check_led(m.group(1), m.group(2), val)
+    if re.fullmatch(r"/sys/class/power_supply/BAT\d+/charge_types", path) or \
+       re.fullmatch(r"/sys/devices/LNXSYSTM:00/.*/power_supply/BAT\d+/charge_types", path):
+        return val in CHARGE
+    return False
+
+
+def main(a):
+    if len(a) == 3 and a[0] == "write":
+        path, val = a[1], a[2]
+        if not validate(path, val):
+            sys.exit("拒绝：%s=%s 不在白名单内" % (path, val))
+        with open(path, "w") as f:
+            f.write(val)
+        print("ok")
+    elif len(a) == 8 and a[0] == "custom":
+        keys = ("STAPM", "FAST", "SLOW", "TCTL", "CTGP")
+        vals = a[1:6]
+        if not all(v.isascii() and v.isdigit() for v in vals):
+            sys.exit("拒绝：参数必须是非负整数")
+        n = dict(zip(keys, map(int, vals)))
+        for k, (lo, hi) in LIMITS.items():
+            if not lo <= n[k] <= hi:
+                sys.exit("拒绝：%s 必须在 %d~%d" % (k, lo, hi))
+        if n["FAST"] < max(n["STAPM"], n["SLOW"]):
+            sys.exit("拒绝：FAST 不能低于 STAPM / SLOW")
+        if a[6] not in ("0", "1") or a[7] not in EPPS:
+            sys.exit("拒绝：boost 只能 0/1，EPP 不在白名单内")
+        os.makedirs(os.path.dirname(CUSTOM_CONF), mode=0o755, exist_ok=True)
+        with open(CUSTOM_CONF, "w") as f:
+            for k in keys:
+                f.write("%s=%d\n" % (k, n[k]))
+            f.write("BOOST=%s\nEPP=%s\n" % (a[6], a[7]))
+        os.chmod(CUSTOM_CONF, 0o644)
+        r = subprocess.run(["/usr/local/bin/ryzenadj-profile", "custom"],
+                           capture_output=True, text=True)
+        print((r.stdout + r.stderr).strip())
+        sys.exit(r.returncode)
+    elif len(a) == 2 and a[0] == "profile" and a[1] in PROFILES:
+        r = subprocess.run(["/usr/local/bin/ryzenadj-profile", a[1]],
+                           capture_output=True, text=True)
+        print((r.stdout + r.stderr).strip())
+        sys.exit(r.returncode)
+    else:
+        sys.exit(__doc__)
+
+
+main(sys.argv[1:])

@@ -1,0 +1,16 @@
+[package]
+name = "jiaolong-ctl"
+version = "0.1.0"
+edition = "2021"
+description = "蛟龙16K (MECHREVO GM6BG0Q) EC 控制中心 — 风扇/温度/性能档/灯条/键盘/充电"
+license = "MIT"
+
+[[bin]]
+name = "jiaolong-ctl"
+path = "src/main.rs"
+
+[dependencies]
+gtk4 = "0.9"
+
+[profile.release]
+opt-level = 2

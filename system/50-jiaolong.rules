@@ -1,0 +1,8 @@
+// 仅放行蛟龙16K 控制中心的白名单助手给本机活动会话里的用户 @USER@
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.policykit.exec" &&
+        action.lookup("program") == "/usr/local/libexec/jiaolong-helper" &&
+        subject.user == "@USER@" && subject.local && subject.active) {
+        return polkit.Result.YES;
+    }
+});

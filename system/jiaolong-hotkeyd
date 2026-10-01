@@ -1,0 +1,85 @@
+#!/usr/bin/python3
+"""监听机身性能模式键（Uniwill WMI 事件 0xB0 → KEY_F14），循环切换功耗档并弹桌面通知。
+
+循环顺序：low-power → balanced → performance →（存在自定义配置时）custom → 回到 low-power。
+当前档位记录在 /run/jiaolong-profile（由 ryzenadj-profile 在成功后写入，因此 GUI/开机服务
+改档位也会同步）。以 root 运行，仅调用 /usr/local/bin/ryzenadj-profile。
+"""
+import glob, os, select, struct, subprocess, sys, time
+
+STATE = "/run/jiaolong-profile"
+CONF = "/etc/jiaolong/custom.conf"
+KEY_F14 = 184
+NAMES = {"low-power": "静音 / 长续航", "balanced": "均衡", "performance": "性能", "custom": "自定义"}
+USER, UID = "@USER@", @UID@
+
+
+def find_event():
+    blk_all = open("/proc/bus/input/devices").read().split("\n\n")
+    for blk in blk_all:
+        if 'Name="Uniwill WMI hotkeys"' in blk:
+            for line in blk.splitlines():
+                if line.startswith("H:"):
+                    for tok in line.split():
+                        if tok.startswith("event"):
+                            return "/dev/input/" + tok
+    return None
+
+
+def current():
+    try:
+        v = open(STATE).read().strip()
+        return v if v in NAMES else "performance"
+    except OSError:
+        return "performance"
+
+
+def notify(text):
+    env = dict(os.environ, DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/%d/bus" % UID)
+    subprocess.run(["runuser", "-u", USER, "--", "env",
+                    "DBUS_SESSION_BUS_ADDRESS=" + env["DBUS_SESSION_BUS_ADDRESS"],
+                    "notify-send", "-a", "蛟龙16K", "-i", "preferences-system",
+                    "-h", "string:x-canonical-private-synchronous:jiaolong-profile",
+                    "性能模式", text], capture_output=True)
+
+
+def cycle():
+    order = ["low-power", "balanced", "performance"]
+    if os.path.exists(CONF):
+        order.append("custom")
+    cur = current()
+    nxt = order[(order.index(cur) + 1) % len(order)] if cur in order else order[0]
+    r = subprocess.run(["/usr/local/bin/ryzenadj-profile", nxt], capture_output=True, text=True)
+    if r.returncode == 0:
+        notify("已切换到：%s" % NAMES[nxt])
+    else:
+        notify("切换到 %s 失败：%s" % (NAMES[nxt], (r.stderr or r.stdout).strip()[:80]))
+    print("按键 → %s (rc=%d)" % (nxt, r.returncode), flush=True)
+
+
+def main():
+    while True:
+        path = find_event()
+        if not path:
+            time.sleep(5)
+            continue
+        fd = os.open(path, os.O_RDONLY)
+        last = 0.0
+        print("监听 %s" % path, flush=True)
+        try:
+            while True:
+                select.select([fd], [], [])
+                data = os.read(fd, 24 * 16)
+                for i in range(0, len(data) - 23, 24):
+                    _, _, t, c, v = struct.unpack("llHHi", data[i:i + 24])
+                    if t == 1 and c == KEY_F14 and v == 1 and time.time() - last > 0.5:
+                        last = time.time()
+                        cycle()
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+        time.sleep(2)
+
+
+main()

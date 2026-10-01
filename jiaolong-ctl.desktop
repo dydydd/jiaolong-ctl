@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=蛟龙 16K 控制中心
+GenericName=Laptop EC Control Center
+Comment=性能档 / 自定义 / 键盘背光 / 充电 — 基于内核 uniwill 驱动
+Exec=jiaolong-ctl
+Icon=preferences-system
+Terminal=false
+Categories=System;Settings;HardwareSettings;
+Keywords=MECHREVO;蛟龙;uniwill;fan;performance;TGP;
+StartupNotify=true

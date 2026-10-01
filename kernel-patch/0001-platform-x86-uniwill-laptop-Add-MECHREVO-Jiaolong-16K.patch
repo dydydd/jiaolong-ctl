@@ -1,0 +1,61 @@
+From: dydydd <admin@lidream.cn>
+Subject: [PATCH] platform/x86: uniwill-laptop: Add MECHREVO Jiaolong 16K
+
+The MECHREVO Jiaolong 16K (board GM6BG0Q) is a TongFang GM6 barebone
+with a standard Uniwill EC (ACPI\INOU0000). The driver currently refuses
+to load on it unless the "force" module parameter is used, which in turn
+enables every feature except the battery charge limit.
+
+Add a DMI entry with an explicit feature set. The features were tested
+on a real machine (BIOS N.1.19MRO15) while loading with force=1:
+
+ - fn_lock, super_key_enable
+ - hwmon: CPU/GPU temperature, both fans
+ - ctgp_offset (RTX 4060 Laptop GPU)
+ - multicolor keyboard backlight with 4 brightness levels
+ - battery charge_types (Standard/Trickle/Long_Life)
+
+The machine has no lightbar. Features that could not be verified (USB-C
+power priority, AC auto boot, USB powershare, touchpad toggle) and the
+battery charge limit are intentionally not enabled.
+
+Signed-off-by: dydydd <admin@lidream.cn>
+---
+--- a/drivers/platform/x86/uniwill/uniwill-acpi.c
++++ b/drivers/platform/x86/uniwill/uniwill-acpi.c
+@@ -2677,6 +2677,20 @@
+ 	.kbd_led_max_brightness = 4,
+ };
+ 
++static struct uniwill_device_descriptor mechrevo_gm6bg0q_descriptor __initdata = {
++	.features = UNIWILL_FEATURE_FN_LOCK |
++		    UNIWILL_FEATURE_SUPER_KEY |
++		    UNIWILL_FEATURE_BATTERY_CHARGE_MODES |
++		    UNIWILL_FEATURE_CPU_TEMP |
++		    UNIWILL_FEATURE_GPU_TEMP |
++		    UNIWILL_FEATURE_PRIMARY_FAN |
++		    UNIWILL_FEATURE_SECONDARY_FAN |
++		    UNIWILL_FEATURE_NVIDIA_CTGP_CONTROL |
++		    UNIWILL_FEATURE_KEYBOARD_BACKLIGHT,
++	.kbd_led_single_color = false,
++	.kbd_led_max_brightness = 4,
++};
++
+ static struct uniwill_device_descriptor lapqc71a_lapqc71b_descriptor __initdata = {
+ 	.features = UNIWILL_FEATURE_SUPER_KEY |
+ 		    UNIWILL_FEATURE_LIGHTBAR |
+@@ -2878,6 +2892,14 @@
+ 		.driver_data = &machenike_l16p_descriptor,
+ 	},
+ 	{
++		.ident = "MECHREVO Jiaolong 16K",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "MECHREVO"),
++			DMI_EXACT_MATCH(DMI_BOARD_NAME, "GM6BG0Q"),
++		},
++		.driver_data = &mechrevo_gm6bg0q_descriptor,
++	},
++	{
+ 		.ident = "XMG FUSION 15 (L19)",
+ 		.matches = {
+ 			DMI_MATCH(DMI_SYS_VENDOR, "SchenkerTechnologiesGmbH"),
